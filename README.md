@@ -2,68 +2,86 @@
   
 # 📊 DataWhisperer
 
-**Talk to your data in plain English.**
+### Talk to your data in plain English.
+AI-powered CSV analysis using natural language.
 
-### 🌐 [👉 CLICK HERE TO VIEW THE LIVE APP 👈](https://data-whisper-manoj.streamlit.app/) 🌐
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-
-[**Features**](#features) • [**Installation**](#installation) • [**Architecture**](#architecture)
+[🚀 **Live Demo**](https://data-whisper-manoj.streamlit.app/) | [📂 **GitHub**](https://github.com/manojperi26/data-whisper)
 
 </div>
 
----
+DataWhisperer lets users upload a CSV and ask questions about their data using natural language. It generates and executes Pandas analysis, validates results, and returns answers, tables, and visualizations.
 
-DataWhisperer is an intelligent data analysis application that turns any CSV file into an interactive conversation. Upload your data, ask questions in natural language, and instantly receive accurate answers, data tables, and beautiful visualizations.
+## Key Features
+- Natural-language data analysis
+- Schema-aware LLM reasoning
+- Automatic Pandas code generation and execution
+- Tables and visualizations
+- Reliability checks for common LLM analysis errors
+- Groq → Ollama fallback
+- Conversation-aware follow-up questions
+- Streamlit interface
 
-## ✨ Features
+## Example Questions
+- "Who are the top 5 players by runs?"
+- "Show the monthly revenue trend."
+- "Which category has the highest average sales?"
+- "Create a chart of revenue by region."
 
-- **🗣️ Natural Language Interface:** No SQL or Pandas knowledge required. Just ask questions.
-- **📈 Automatic Visualizations:** The agent automatically generates, saves, and displays matplotlib charts.
-- **🧠 ReAct Agent Logic:** Employs LangChain's ReAct agent to write, execute, and verify Pandas code in a sandboxed Python REPL.
-- **🛡️ Data Privacy & Sandboxing:** The AI model never sees your raw data. It only sees your column schema and operates locally on your dataframe.
-- **⚡ Dual-LLM Architecture:** Uses high-speed **Groq (Llama-3.3-70B)** by default, with a seamless automatic fallback to a local **Ollama** instance if API limits are reached.
+## Architecture
 
-## 🚀 Quickstart (Local)
+```mermaid
+flowchart TD
+    A[CSV Upload] --> B[Schema Inspection]
+    B --> C[Natural Language Query]
+    C --> D[LLM / ReAct Agent]
+    D --> E[Pandas Execution]
+    E --> F[Result Validation]
+    F --> G[Answer / Table / Chart]
+```
 
-### 1. Clone the repository
+## Reliability
+DataWhisperer includes safeguards against common LLM data-analysis failures:
+- Incorrect aggregation scope
+- Hallucinated column names
+- Filter-after-aggregate mistakes
+- NaN handling
+- dtype mismatches
+- Incorrect sorting
+- Empty-result detection
+- Chart generation failures
+- DataFrame mutation
+- Tie handling
+- Follow-up context
+
+## Tech Stack
+Python · Pandas · LangChain · Groq · Ollama · Matplotlib · Streamlit
+
+## Run Locally
+
 ```bash
 git clone https://github.com/manojperi26/data-whisper.git
 cd data-whisper
-```
-
-### 2. Install dependencies
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Setup Environment Variables
-Create a `.env` file in the root directory (you can copy `.env.example`) and add your Groq API key:
+Create a `.env` file in the root directory and add your API key:
 ```ini
-GROQ_API_KEY="your_groq_api_key_here"
+GROQ_API_KEY="your_api_key_here"
 ```
 
-### 4. Run the application
+Start the application:
 ```bash
 streamlit run app.py
 ```
-Visit `http://localhost:8501` in your browser.
 
-## ☁️ Deployment (Streamlit Cloud)
-
-DataWhisperer is optimized for deployment on Streamlit Community Cloud:
-1. Push this repository to your GitHub account.
-2. Go to [share.streamlit.io](https://share.streamlit.io/).
-3. Deploy the app by selecting your repository and pointing the main file to `app.py`.
-4. In the **Advanced Settings** > **Secrets** menu, add your API key: `GROQ_API_KEY = "..."`.
-
-## 🏗️ Architecture
-
-DataWhisperer is built with a highly resilient prompt architecture designed specifically for data analysis:
-- **Schema Awareness:** The LLM is provided a dynamically generated schema summary of your CSV to prevent hallucinated columns or data types.
-- **Strict Execution Rules:** The agent operates under a strict 14-point rule system to handle NaNs, prevent arbitrary aggregations, and ensure visualizations are explicitly saved to disk rather than trapped in standard output.
-- **Auto-Correction:** If the generated Pandas code fails, the agent receives the exact Python stack trace and uses its remaining iteration budget to auto-correct and retry the execution.
-
-## 📄 License
-This project is licensed under the [MIT License](LICENSE).
+## Project Structure
+```text
+data-whisper/
+├── app.py
+├── style.css
+├── test_reliability.py
+├── requirements.txt
+├── notebooks/
+│   └── DataWhisperer.ipynb
+└── README.md
+```

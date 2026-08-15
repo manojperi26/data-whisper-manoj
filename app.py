@@ -150,7 +150,7 @@ if uploaded:
     repl_tool = PythonAstREPLTool(locals=safe_locals)
     repl_tool.name = "python_repl"
     repl_tool.description = (
-        "A sandboxed Python shell with access ONLY to a pandas dataframe named df, "
+        "A restricted Python execution environment with access ONLY to a pandas dataframe named df, "
         "pandas as pd, and matplotlib.pyplot as plt. Use it to run pandas code that "
         "answers questions about the data. To make a chart, build it with plt and "
         "save it using a unique filename (e.g. plt.savefig('chart_1.png')). Verify it "
