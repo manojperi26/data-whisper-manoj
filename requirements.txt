@@ -1,0 +1,9 @@
+streamlit
+langchain
+langchain-classic
+langchain-experimental
+langchain-groq
+langchain-ollama
+pandas
+matplotlib
+pytest
