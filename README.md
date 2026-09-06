@@ -5,7 +5,7 @@
 ### Talk to your data in plain English.
 AI-powered CSV analysis using natural language.
 
-[🚀 **Live Demo**](https://data-whisper-manoj.streamlit.app/) | [📂 **GitHub**](https://github.com/manojperi26/data-whisper)
+[🚀 **Live Demo**](https://data-whisper-manoj-7kpjznwt7ycm4fbbxrgxv8.streamlit.app/) | [📂 **GitHub**](https://github.com/manojperi26/data-whisper)
 
 </div>
 
