@@ -49,7 +49,7 @@ def get_llm(api_key):
         ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1")
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         return ChatOllama(model=ollama_model, temperature=0, base_url=base_url)
-    return ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=api_key, temperature=0)
+    return ChatGroq(model="openai/gpt-oss-120b", groq_api_key=api_key, temperature=0)
 
 st.set_page_config(page_title="DataWhisperer", layout="wide", initial_sidebar_state="expanded")
 
