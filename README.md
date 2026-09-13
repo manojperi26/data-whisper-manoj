@@ -17,7 +17,8 @@ DataWhisperer lets users upload a CSV and ask questions about their data using n
 - Automatic Pandas code generation and execution
 - Tables and visualizations
 - Reliability checks for common LLM analysis errors
-- Groq → Ollama fallback
+- Session-scoped Groq or Local Ollama selection
+- Explicit switch to Ollama when Groq is unavailable
 - Conversation-aware follow-up questions
 - Streamlit interface
 
@@ -64,7 +65,7 @@ cd data-whisper
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the root directory and add your API key:
+Create a `.env` file in the root directory and add your Groq API key if you choose Groq at launch:
 ```ini
 GROQ_API_KEY="your_api_key_here"
 ```

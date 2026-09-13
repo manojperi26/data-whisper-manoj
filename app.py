@@ -50,10 +50,15 @@ st.set_page_config(page_title="DataWhisperer", layout="wide", initial_sidebar_st
 with open("style.css") as f:
     st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
+if "llm_provider" not in st.session_state:
+    st.session_state.llm_provider = None
+if "provider_error" not in st.session_state:
+    st.session_state.provider_error = False
+
 st.markdown("""
 <div class="custom-header">
     <div>
-        <div class="header-title">◉ DataWhisperer</div>
+        <div class="header-title"><span class="brand-mark">◒</span> DataWhisperer</div>
         <div class="header-subtitle">Talk to your data</div>
     </div>
     <div class="header-status">
@@ -63,15 +68,37 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.sidebar.markdown("<br><br><br>", unsafe_allow_html=True)
+st.sidebar.markdown("<div class='sidebar-brand'><span class='brand-mark'>◒</span><span>DataWhisperer</span></div>", unsafe_allow_html=True)
+st.sidebar.markdown("<div class='sidebar-label'>CONNECTION</div>", unsafe_allow_html=True)
 api_key = st.sidebar.text_input(
     "Groq API Key",
     type="password",
     value=os.environ.get("GROQ_API_KEY", ""),
     help="Get a free key at console.groq.com/keys",
 )
-st.sidebar.markdown("---")
+if st.session_state.llm_provider is None:
+    st.markdown("""
+    <div class="welcome-shell">
+        <div class="eyebrow">YOUR PRIVATE DATA ANALYST</div>
+        <h1>Meet your data<br><span>in a new light.</span></h1>
+        <p>Choose how DataWhisper should reason over your CSV. Your choice stays active for this session.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    provider_choice = st.radio("Choose an LLM provider", ["Groq API", "Local Ollama"], index=None, horizontal=True, key="provider_choice")
+    if provider_choice:
+        st.session_state.llm_provider = provider_choice
+        st.rerun()
+    st.stop()
 
+st.sidebar.markdown("<div class='sidebar-label'>MODEL</div>", unsafe_allow_html=True)
+provider_choice = st.sidebar.radio("Provider", ["Groq API", "Local Ollama"], index=0 if st.session_state.llm_provider == "Groq API" else 1, label_visibility="collapsed")
+if provider_choice != st.session_state.llm_provider:
+    st.session_state.llm_provider = provider_choice
+    st.session_state.provider_error = False
+    st.rerun()
+st.sidebar.markdown("<div class='sidebar-rule'></div>", unsafe_allow_html=True)
+
+st.markdown("<div class='section-kicker'>WORKSPACE</div>", unsafe_allow_html=True)
 uploaded = st.file_uploader("Drop your CSV here", type=["csv"])
 
 if "chat_history" not in st.session_state:
@@ -79,7 +106,8 @@ if "chat_history" not in st.session_state:
 
 if uploaded:
     df = pd.read_csv(uploaded)
-    st.dataframe(df.head(10))
+    with st.expander("Preview dataset", expanded=False):
+        st.dataframe(df.head(10), use_container_width=True)
 
     # need this so the model stops guessing column names/values and gets them wrong
     def build_schema_summary(frame):
@@ -111,26 +139,23 @@ if uploaded:
     </div>
     """, unsafe_allow_html=True)
     
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Rows", f"{df.shape[0]:,}")
-    c2.metric("Columns", df.shape[1])
-    c3.metric("Missing", f"{missing_pct:.1f}%")
+    duplicate_count = int(df.duplicated().sum())
+    st.markdown("<div class='section-kicker'>DATASET OVERVIEW</div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    for column, label, value, detail in [(c1, "Rows", f"{df.shape[0]:,}", "records loaded"), (c2, "Columns", f"{df.shape[1]}", "fields detected"), (c3, "Missing data", f"{missing_pct:.1f}%", "of all values"), (c4, "Duplicates", f"{duplicate_count:,}", "repeated rows")]:
+        column.markdown(f"<div class='stat-card'><div class='stat-label'>{label}</div><div class='stat-value'>{value}</div><div class='stat-detail'>{detail}</div></div>", unsafe_allow_html=True)
 
-    st.sidebar.markdown("### DATASET")
-    st.sidebar.caption(f"**{uploaded.name}**\n\n{df.shape[0]:,} rows\n\n{df.shape[1]} columns")
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### DATA QUALITY")
-    st.sidebar.caption(f"Missing: {missing_pct:.1f}%\n\nDuplicates: {df.duplicated().sum():,}")
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### COLUMNS")
-    st.sidebar.caption(" · ".join(df.columns.tolist()[:10]) + ("..." if len(df.columns) > 10 else ""))
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### SESSION")
+    st.sidebar.markdown(f"<div class='side-dataset'><div class='side-file'>{uploaded.name}</div><div>{df.shape[0]:,} rows · {df.shape[1]} columns</div></div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-label'>DATA HEALTH</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='side-health'><span class='health-dot'></span>{missing_pct:.1f}% missing<br><span class='health-dot'></span>{duplicate_count:,} duplicates</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-label'>COLUMNS</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='side-columns'>" + "".join(f"<span>{col}</span>" for col in df.columns.tolist()[:12]) + ("<span>...</span>" if len(df.columns) > 12 else "") + "</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-label'>SESSION</div>", unsafe_allow_html=True)
     if st.sidebar.button("Clear chat"):
         st.session_state.chat_history = []
         st.rerun()
 
-    llm = get_llm(api_key)
+    llm = get_llm(api_key if st.session_state.llm_provider == "Groq API" else "")
     is_ollama = isinstance(llm, ChatOllama)
     
     if is_ollama:
@@ -212,9 +237,9 @@ Question: {input}
             st.write(turn['q'])
         with st.chat_message("assistant"):
             if turn.get("provider"):
-                st.caption(f"DataWhisperer · {turn['provider']}")
+                st.caption(f"DataWhisper · {turn['provider']}")
             else:
-                st.caption("DataWhisperer")
+                st.caption("DataWhisper")
             st.write(turn["a"])
             if turn.get("chart"):
                 st.image(turn["chart"])
@@ -226,7 +251,7 @@ Question: {input}
     if sc1.button("Top 5 products"): suggested = "Top 5 products"
     if sc2.button("Find anomalies"): suggested = "Find anomalies"
     if sc3.button("Show trends"): suggested = "Show trends"
-    if sc4.button("Missing values"): suggested = "Missing values"
+    if sc4.button("Find missing values"): suggested = "Find missing values"
     
     question = st.chat_input("Ask anything about your data...") or suggested
     if question:
@@ -244,32 +269,9 @@ Question: {input}
             try:
                 result = executor.invoke({"input": question, "chat_history": history_text, "schema": schema_summary})
             except Exception as e:
-                if not is_ollama and ("rate_limit_exceeded" in str(e) or "429" in str(e)):
-                    st.info("Groq rate limit hit — switched to local Ollama (llama3.1) for this response.")
-                    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-                    if not check_ollama_health(base_url):
-                        error_to_show = f"Ollama is not reachable at {base_url}. Start the Ollama app and make sure the configured model is available before using local fallback."
-                    else:
-                        try:
-                            fallback_llm = ChatOllama(
-                                model=os.environ.get("OLLAMA_MODEL", "llama3.1"), 
-                                temperature=0, 
-                                base_url=base_url
-                            )
-                            fallback_agent = create_react_agent(fallback_llm, tools, prompt)
-                            fallback_executor = AgentExecutor(
-                                agent=fallback_agent, tools=tools, verbose=True,
-                                handle_parsing_errors=True,
-                                max_iterations=15,
-                                max_execution_time=120,
-                                early_stopping_method="generate",
-                            )
-                            result = fallback_executor.invoke({"input": question, "chat_history": history_text, "schema": schema_summary})
-                            provider_used = "Ollama (fallback)"
-                        except Exception as fallback_e:
-                            error_to_show = f"Error during Ollama fallback: {fallback_e}"
-                else:
-                    error_to_show = e
+                if not is_ollama:
+                    st.session_state.provider_error = True
+                error_to_show = e
 
             if error_to_show is not None:
                 if isinstance(error_to_show, Exception):
@@ -278,6 +280,16 @@ Question: {input}
                         st.exception(error_to_show)
                 else:
                     st.error(error_to_show)
+                if st.session_state.provider_error:
+                    st.warning("Groq API is unavailable. Would you like to switch to Local Ollama?")
+                    switch_col, stay_col = st.columns(2)
+                    if switch_col.button("Switch to Ollama", type="primary"):
+                        st.session_state.llm_provider = "Local Ollama"
+                        st.session_state.provider_error = False
+                        st.rerun()
+                    if stay_col.button("Stay with Groq"):
+                        st.session_state.provider_error = False
+                        st.rerun()
             elif result is not None:
                 answer = result["output"]
                 intermediate = result.get("intermediate_steps", [])
@@ -305,7 +317,7 @@ Question: {input}
 
                 warnings = validate_result(question, answer, chart_saved=bool(chart_path))
 
-                st.markdown("### Answer")
+                st.markdown("<div class='answer-heading'><span class='assistant-avatar'>◒</span><span>DataWhisper</span><span class='answer-label'>ANSWER</span></div>", unsafe_allow_html=True)
                 for w in warnings:
                     st.warning(f"⚠️ **Validation Warning:** {w}")
                 st.write(answer)
@@ -329,9 +341,10 @@ Question: {input}
 else:
     st.markdown("""
     <div class="hero-container">
-        <h1 class="hero-title">DataWhisperer</h1>
+        <div class="eyebrow">CSV INTELLIGENCE, WITHOUT THE FRICTION</div>
+        <h1 class="hero-title">Ask better questions<br><span>of your data.</span></h1>
         <div class="hero-subtitle">
-            Upload a CSV and ask questions in plain English. Get answers, tables, and beautiful visualizations.
+            Upload a CSV and let DataWhisper turn rows into clear answers, useful trends, and beautiful visualizations.
         </div>
     </div>
     """, unsafe_allow_html=True)
