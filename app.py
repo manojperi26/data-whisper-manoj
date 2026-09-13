@@ -23,21 +23,15 @@ def check_ollama_health(base_url):
     except Exception:
         return False
 
-def validate_result(question, answer, intermediate_steps):
+def validate_result(question, answer, chart_saved):
     warnings = []
     lower_ans = str(answer).lower().strip()
     
     if lower_ans in ["0", "0.0", "empty", "none", "[]", "no data"] or lower_ans.startswith("0\n"):
         warnings.append("The result is zero or empty. Check if the filter criteria was too strict or misspelled.")
         
-    if any(kw in question.lower() for kw in ["chart", "plot", "graph"]):
-        saved_chart = False
-        for action, obs in intermediate_steps:
-            if "plt.savefig" in str(getattr(action, "tool_input", "")):
-                saved_chart = True
-                break
-        if not saved_chart and "plt.savefig" not in lower_ans:
-            warnings.append("You asked for a chart, but the agent did not appear to save one correctly.")
+    if any(kw in question.lower() for kw in ["chart", "plot", "graph"]) and not chart_saved:
+        warnings.append("You asked for a chart, but the agent did not appear to save one correctly.")
             
     if "failed to execute" in lower_ans:
         warnings.append("The agent encountered an error it could not recover from.")
@@ -49,7 +43,7 @@ def get_llm(api_key):
         ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1")
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         return ChatOllama(model=ollama_model, temperature=0, base_url=base_url)
-    return ChatGroq(model="qwen/qwen3.6-27b", groq_api_key=api_key, temperature=0)
+    return ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=api_key, temperature=0)
 
 st.set_page_config(page_title="DataWhisperer", layout="wide", initial_sidebar_state="expanded")
 
@@ -236,8 +230,6 @@ Question: {input}
     
     question = st.chat_input("Ask anything about your data...") or suggested
     if question:
-        for old_png in glob.glob("*.png"):
-            os.remove(old_png)
         plt.close("all")
 
         history_text = "\n".join(
@@ -289,13 +281,6 @@ Question: {input}
             elif result is not None:
                 answer = result["output"]
                 intermediate = result.get("intermediate_steps", [])
-                
-                warnings = validate_result(question, answer, intermediate)
-                
-                st.markdown("### Answer")
-                for w in warnings:
-                    st.warning(f"⚠️ **Validation Warning:** {w}")
-                st.write(answer)
 
                 chart_path = "chart.png" if os.path.exists("chart.png") else None
 
@@ -304,11 +289,26 @@ Question: {input}
                     if pngs:
                         chart_path = max(pngs, key=os.path.getctime)
 
-                # spent way too long figuring out charts werent showing - turned out sometimes
-                # the agent builds the fig but never calls savefig at all. this grabs it anyway
                 if chart_path is None and plt.get_fignums():
                     chart_path = "chart.png"
                     plt.savefig(chart_path, bbox_inches="tight")
+
+                if chart_path:
+                    unique_path = f"chart_{len(st.session_state.chat_history)}.png"
+                    if chart_path != unique_path:
+                        try:
+                            os.replace(chart_path, unique_path)
+                        except OSError:
+                            pass
+                        else:
+                            chart_path = unique_path
+
+                warnings = validate_result(question, answer, chart_saved=bool(chart_path))
+
+                st.markdown("### Answer")
+                for w in warnings:
+                    st.warning(f"⚠️ **Validation Warning:** {w}")
+                st.write(answer)
 
                 if chart_path:
                     st.image(chart_path)
