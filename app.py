@@ -13,6 +13,61 @@ import requests
 from langchain_experimental.tools import PythonAstREPLTool
 from langchain_classic.agents import AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
+from langchain_core.callbacks import BaseCallbackHandler
+
+THINKING_STEPS = [
+    "Understanding your question",
+    "Generating Pandas code",
+    "Executing analysis",
+    "Validating result",
+    "Creating visualization",
+]
+
+
+class ThinkingCallback(BaseCallbackHandler):
+    """Drives the live checklist shown while the agent works, using real
+    LangChain lifecycle hooks instead of a fake timer."""
+
+    def __init__(self, placeholder):
+        self.placeholder = placeholder
+        self.stage = 0
+        self.render()
+
+    def render(self):
+        lines = []
+        for i, label in enumerate(THINKING_STEPS):
+            if i < self.stage:
+                mark = "✓"
+            elif i == self.stage:
+                mark = "●"
+            else:
+                mark = "○"
+            lines.append(f"{mark} {label}")
+        self.placeholder.markdown(
+            "**DataWhisperer is analyzing...**\n\n" + "\n\n".join(lines)
+        )
+
+    def advance_to(self, stage):
+        if stage > self.stage:
+            self.stage = stage
+            self.render()
+
+    def on_llm_start(self, *args, **kwargs):
+        self.advance_to(1)  # generating pandas code
+
+    def on_agent_action(self, action, **kwargs):
+        self.advance_to(2)  # executing analysis
+
+    def on_tool_end(self, output, **kwargs):
+        self.advance_to(3)  # validating result
+
+    def on_agent_finish(self, finish, **kwargs):
+        self.advance_to(3)
+
+GROQ_MODEL = "qwen/qwen3.6-27b"
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
 
 @st.cache_resource(ttl=300)
 def check_ollama_health(base_url):
@@ -23,91 +78,227 @@ def check_ollama_health(base_url):
     except Exception:
         return False
 
+
 def validate_result(question, answer, chart_saved):
     warnings = []
     lower_ans = str(answer).lower().strip()
-    
+
     if lower_ans in ["0", "0.0", "empty", "none", "[]", "no data"] or lower_ans.startswith("0\n"):
         warnings.append("The result is zero or empty. Check if the filter criteria was too strict or misspelled.")
-        
+
     if any(kw in question.lower() for kw in ["chart", "plot", "graph"]) and not chart_saved:
         warnings.append("You asked for a chart, but the agent did not appear to save one correctly.")
-            
+
     if "failed to execute" in lower_ans:
         warnings.append("The agent encountered an error it could not recover from.")
-        
+
     return warnings
 
-def get_llm(api_key):
-    if not api_key or not api_key.strip():
-        ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1")
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        return ChatOllama(model=ollama_model, temperature=0, base_url=base_url)
-    return ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=api_key, temperature=0)
+
+def classify_groq_error(e):
+    """Turn a raw exception into a (type, human message) pair so the user
+    gets an accurate, specific error instead of one generic 'limit reached' message."""
+    s = str(e).lower()
+    if "401" in s or "invalid_api_key" in s or "invalid api key" in s:
+        return "invalid_key", "Your Groq API key was rejected. It may be incorrect, revoked, or expired."
+    if "429" in s or "rate_limit_exceeded" in s or "rate limit" in s:
+        return "rate_limit", "Your Groq API key has hit its rate limit for now."
+    if "insufficient_quota" in s or "quota" in s:
+        return "quota", "Your Groq account has run out of quota."
+    if "model_not_found" in s or "does not exist" in s:
+        return "model", f"The model '{GROQ_MODEL}' isn't available on your Groq account."
+    if "connection" in s or "timeout" in s or "network" in s:
+        return "network", "Couldn't reach Groq's servers. This looks like a network issue."
+    return "unknown", str(e)
+
+
+def build_agent(llm, tools, prompt):
+    agent = create_react_agent(llm, tools, prompt)
+    return AgentExecutor(
+        agent=agent, tools=tools, verbose=True,
+        handle_parsing_errors=True,
+        max_iterations=15,
+        max_execution_time=120,
+        early_stopping_method="generate",
+    )
+
 
 st.set_page_config(page_title="DataWhisperer", layout="wide", initial_sidebar_state="expanded")
 
 with open("style.css") as f:
     st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
-if "llm_provider" not in st.session_state:
-    st.session_state.llm_provider = None
-if "provider_error" not in st.session_state:
-    st.session_state.provider_error = False
+# ---------------------------------------------------------------------------
+# Session state defaults
+# ---------------------------------------------------------------------------
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "provider" not in st.session_state:
+    st.session_state.provider = None          # None | "groq" | "ollama"
+if "groq_key" not in st.session_state:
+    st.session_state.groq_key = ""
+if "groq_error" not in st.session_state:
+    st.session_state.groq_error = None         # dict: {"type": ..., "msg": ...} or None
 
-st.markdown("""
+# ---------------------------------------------------------------------------
+# Top header (always shown)
+# ---------------------------------------------------------------------------
+if st.session_state.provider == "groq":
+    provider_label = f"● Groq &middot; {GROQ_MODEL}"
+elif st.session_state.provider == "ollama":
+    provider_label = f"● Ollama &middot; {OLLAMA_MODEL}"
+else:
+    provider_label = "No engine selected"
+
+st.markdown(f"""
 <div class="custom-header">
     <div>
-        <div class="header-title"><span class="brand-mark">◒</span> DataWhisperer</div>
+        <div class="header-title">◉ DataWhisperer</div>
         <div class="header-subtitle">Talk to your data</div>
     </div>
     <div class="header-status">
         <div class="status-dot"></div>
-        Ready
+        {provider_label}
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-st.sidebar.markdown("<div class='sidebar-brand'><span class='brand-mark'>◒</span><span>DataWhisperer</span></div>", unsafe_allow_html=True)
-st.sidebar.markdown("<div class='sidebar-label'>CONNECTION</div>", unsafe_allow_html=True)
-api_key = st.sidebar.text_input(
-    "Groq API Key",
-    type="password",
-    value=os.environ.get("GROQ_API_KEY", ""),
-    help="Get a free key at console.groq.com/keys",
-)
-if st.session_state.llm_provider is None:
+if st.session_state.provider is not None:
+    if st.sidebar.button("Change AI engine"):
+        st.session_state.provider = None
+        st.session_state.groq_error = None
+        st.rerun()
+    st.sidebar.markdown("---")
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Explicit engine choice (never auto-selected, never auto-switched)
+# ---------------------------------------------------------------------------
+if st.session_state.provider is None:
     st.markdown("""
-    <div class="welcome-shell">
-        <div class="eyebrow">YOUR PRIVATE DATA ANALYST</div>
-        <h1>Meet your data<br><span>in a new light.</span></h1>
-        <p>Choose how DataWhisper should reason over your CSV. Your choice stays active for this session.</p>
+    <div style="text-align:center; margin: 2rem 0 2.5rem 0;">
+        <h2 style="margin-bottom: 0.3rem;">Choose your AI engine</h2>
+        <p style="color: rgba(232,232,236,0.6);">
+            DataWhisperer uses an AI model to understand your questions and generate Pandas analysis.<br>
+            This choice will not change automatically — you're always in control.
+        </p>
     </div>
     """, unsafe_allow_html=True)
-    provider_choice = st.radio("Choose an LLM provider", ["Groq API", "Local Ollama"], index=None, horizontal=True, key="provider_choice")
-    if provider_choice:
-        st.session_state.llm_provider = provider_choice
-        st.rerun()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        <div class="glass-panel" style="padding: 1.5rem;">
+            <h3>⚡ Groq</h3>
+            <p style="color: rgba(232,232,236,0.6); font-size: 0.9rem;">
+                Fast cloud inference. Requires an API key.<br><br>
+                ✓ Very fast &nbsp;·&nbsp; ✓ Powerful models<br>
+                ⚠ Subject to rate limits / quota
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Select Groq", use_container_width=True):
+            st.session_state.provider = "groq"
+            st.rerun()
+
+    with col2:
+        st.markdown("""
+        <div class="glass-panel" style="padding: 1.5rem;">
+            <h3>◉ Ollama</h3>
+            <p style="color: rgba(232,232,236,0.6); font-size: 0.9rem;">
+                Runs locally on your machine.<br><br>
+                ✓ Private &nbsp;·&nbsp; ✓ No API key needed<br>
+                ⚠ Requires Ollama running locally
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Select Ollama", use_container_width=True):
+            st.session_state.provider = "ollama"
+            st.rerun()
+
     st.stop()
 
-st.sidebar.markdown("<div class='sidebar-label'>MODEL</div>", unsafe_allow_html=True)
-provider_choice = st.sidebar.radio("Provider", ["Groq API", "Local Ollama"], index=0 if st.session_state.llm_provider == "Groq API" else 1, label_visibility="collapsed")
-if provider_choice != st.session_state.llm_provider:
-    st.session_state.llm_provider = provider_choice
-    st.session_state.provider_error = False
-    st.rerun()
-st.sidebar.markdown("<div class='sidebar-rule'></div>", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# STEP 2A — Groq key entry / re-entry (shown whenever key missing or rejected)
+# ---------------------------------------------------------------------------
+if st.session_state.provider == "groq" and (not st.session_state.groq_key or (st.session_state.groq_error and st.session_state.groq_error["type"] == "invalid_key")):
+    st.markdown("### Connect Groq")
+    if st.session_state.groq_error and st.session_state.groq_error["type"] == "invalid_key":
+        st.error(st.session_state.groq_error["msg"])
+    new_key = st.text_input(
+        "Groq API Key",
+        type="password",
+        help="Get a free key at console.groq.com/keys",
+    )
+    if st.button("Test & Continue"):
+        if new_key.strip():
+            st.session_state.groq_key = new_key.strip()
+            st.session_state.groq_error = None
+            st.rerun()
+        else:
+            st.warning("Enter a key first.")
+    st.stop()
 
-st.markdown("<div class='section-kicker'>WORKSPACE</div>", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# STEP 2B — Ollama health check (shown whenever it's not reachable)
+# ---------------------------------------------------------------------------
+if st.session_state.provider == "ollama":
+    if not check_ollama_health(OLLAMA_BASE_URL):
+        st.markdown("### Use Ollama locally")
+        st.error(f"⚠ Ollama isn't reachable at {OLLAMA_BASE_URL}. Start it and make sure '{OLLAMA_MODEL}' is pulled.")
+        if st.button("Retry connection"):
+            check_ollama_health.clear()
+            st.rerun()
+        st.stop()
+
+# ---------------------------------------------------------------------------
+# STEP 3 — Groq error resolution screen (only reachable mid-conversation,
+# after an actual failed call). Never auto-switches providers.
+# ---------------------------------------------------------------------------
+if st.session_state.groq_error is not None and st.session_state.groq_error["type"] != "invalid_key":
+    err = st.session_state.groq_error
+    title = {
+        "rate_limit": "⚠ Groq limit reached",
+        "quota": "⚠ Groq quota exhausted",
+        "network": "⚠ Network error reaching Groq",
+        "model": "⚠ Groq model unavailable",
+        "unknown": "⚠ Groq error",
+    }.get(err["type"], "⚠ Groq error")
+
+    st.markdown(f"### {title}")
+    st.warning(err["msg"])
+    st.caption("Your dataset and previous analyses are safe.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("🔑 Enter a new Groq key"):
+            st.session_state.groq_key = ""
+            st.session_state.groq_error = {"type": "invalid_key", "msg": "Enter a new key to continue with Groq."}
+            st.rerun()
+    with c2:
+        if st.button("◉ Switch to Ollama"):
+            st.session_state.provider = "ollama"
+            st.session_state.groq_error = None
+            st.rerun()
+    with c3:
+        if err["type"] in ("network", "unknown") and st.button("↻ Retry"):
+            st.session_state.groq_error = None
+            st.rerun()
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# From here on, the provider is confirmed ready. Build the LLM.
+# ---------------------------------------------------------------------------
+if st.session_state.provider == "groq":
+    llm = ChatGroq(model=GROQ_MODEL, groq_api_key=st.session_state.groq_key, temperature=0)
+    is_ollama = False
+else:
+    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0, base_url=OLLAMA_BASE_URL)
+    is_ollama = True
+
 uploaded = st.file_uploader("Drop your CSV here", type=["csv"])
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
 if uploaded:
     df = pd.read_csv(uploaded)
-    with st.expander("Preview dataset", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
 
     # need this so the model stops guessing column names/values and gets them wrong
     def build_schema_summary(frame):
@@ -131,166 +322,208 @@ if uploaded:
     schema_summary = build_schema_summary(df)
 
     missing_pct = (df.isnull().sum().sum() / (df.shape[0] * df.shape[1])) * 100
-    
+
     st.markdown(f"""
-    <div class="glass-panel" style="padding: 1rem 1.5rem; margin-bottom: 2rem;">
+    <div class="glass-panel" style="padding: 1rem 1.5rem; margin-bottom: 1.5rem;">
         <div style="font-weight: 600; font-size: 1.1rem; margin-bottom: 0.2rem;">{uploaded.name}</div>
         <div style="color: rgba(255,255,255,0.6); font-size: 0.9rem;">{df.shape[0]:,} rows &nbsp;·&nbsp; {df.shape[1]} columns &nbsp;·&nbsp; Ready</div>
     </div>
     """, unsafe_allow_html=True)
-    
-    duplicate_count = int(df.duplicated().sum())
-    st.markdown("<div class='section-kicker'>DATASET OVERVIEW</div>", unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    for column, label, value, detail in [(c1, "Rows", f"{df.shape[0]:,}", "records loaded"), (c2, "Columns", f"{df.shape[1]}", "fields detected"), (c3, "Missing data", f"{missing_pct:.1f}%", "of all values"), (c4, "Duplicates", f"{duplicate_count:,}", "repeated rows")]:
-        column.markdown(f"<div class='stat-card'><div class='stat-label'>{label}</div><div class='stat-value'>{value}</div><div class='stat-detail'>{detail}</div></div>", unsafe_allow_html=True)
 
-    st.sidebar.markdown(f"<div class='side-dataset'><div class='side-file'>{uploaded.name}</div><div>{df.shape[0]:,} rows · {df.shape[1]} columns</div></div>", unsafe_allow_html=True)
-    st.sidebar.markdown("<div class='sidebar-label'>DATA HEALTH</div>", unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class='side-health'><span class='health-dot'></span>{missing_pct:.1f}% missing<br><span class='health-dot'></span>{duplicate_count:,} duplicates</div>", unsafe_allow_html=True)
-    st.sidebar.markdown("<div class='sidebar-label'>COLUMNS</div>", unsafe_allow_html=True)
-    st.sidebar.markdown("<div class='side-columns'>" + "".join(f"<span>{col}</span>" for col in df.columns.tolist()[:12]) + ("<span>...</span>" if len(df.columns) > 12 else "") + "</div>", unsafe_allow_html=True)
-    st.sidebar.markdown("<div class='sidebar-label'>SESSION</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("### WORKSPACE")
+    if "page" not in st.session_state:
+        st.session_state.page = "Ask Data"
+    st.session_state.page = st.sidebar.radio(
+        "nav", ["Ask Data", "Overview", "Visualizations", "Data Explorer"],
+        label_visibility="collapsed",
+        index=["Ask Data", "Overview", "Visualizations", "Data Explorer"].index(st.session_state.page),
+    )
+    st.sidebar.markdown("---")
+
+    st.sidebar.markdown("### DATASET")
+    st.sidebar.caption(f"**{uploaded.name}**\n\n{df.shape[0]:,} rows\n\n{df.shape[1]} columns")
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### DATA QUALITY")
+    st.sidebar.caption(f"Missing: {missing_pct:.1f}%\n\nDuplicates: {df.duplicated().sum():,}")
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### COLUMNS")
+    st.sidebar.caption(" · ".join(df.columns.tolist()[:10]) + ("..." if len(df.columns) > 10 else ""))
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### SESSION")
     if st.sidebar.button("Clear chat"):
         st.session_state.chat_history = []
         st.rerun()
 
-    llm = get_llm(api_key if st.session_state.llm_provider == "Groq API" else "")
-    is_ollama = isinstance(llm, ChatOllama)
-    
-    if is_ollama:
-        ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.1")
-        st.sidebar.caption(f"LLM: Ollama • {ollama_model}")
-    else:
-        st.sidebar.caption("LLM: Groq • llama-3.3-70b-versatile")
+    if st.session_state.page == "Overview":
+        st.markdown("## Dataset Overview")
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        oc1.metric("Rows", f"{df.shape[0]:,}")
+        oc2.metric("Columns", df.shape[1])
+        oc3.metric("Missing", f"{missing_pct:.1f}%")
+        oc4.metric("Duplicates", f"{df.duplicated().sum():,}")
 
-    # locking the repl down to just these 3 objects so it cant touch disk/files/internet
-    safe_locals = {"df": df, "pd": pd, "plt": plt}
-    repl_tool = PythonAstREPLTool(locals=safe_locals)
-    repl_tool.name = "python_repl"
-    repl_tool.description = (
-        "A restricted Python execution environment with access ONLY to a pandas dataframe named df, "
-        "pandas as pd, and matplotlib.pyplot as plt. Use it to run pandas code that "
-        "answers questions about the data. To make a chart, build it with plt and "
-        "save it using a unique filename (e.g. plt.savefig('chart_1.png')). Verify it "
-        "is saved and not empty using os.path.exists and os.path.getsize instead of plt.show()."
-    )
-    tools = [repl_tool]
+        st.markdown("#### Dataset Health")
+        dup_count = df.duplicated().sum()
+        st.markdown(
+            "\u2713 Dataset loaded  \n\u2713 Types detected  \n" +
+            ("\u2713 No duplicate rows" if dup_count == 0 else f"\u26a0 {dup_count} duplicate rows found") +
+            "  \n\u2713 Missing values analyzed"
+        )
 
-    prompt = PromptTemplate.from_template("""
-You are a careful data analyst agent. A pandas dataframe called df is already loaded (do not reload or redefine it).
-Answer the user's question by writing and running pandas/matplotlib code with the python_repl tool.
-Always include the exact code you ran in your final answer, for transparency.
+        st.markdown("#### Column Overview")
+        numeric_cols = set(df.select_dtypes(include="number").columns)
+        text_cols = set(df.select_dtypes(include="object").columns)
+        for col in df.columns:
+            kind = "Numeric" if col in numeric_cols else ("Text" if col in text_cols else "Other")
+            st.caption(f"**{col}** \u2014 {kind}")
 
-Dataset schema (trust this, do not guess or assume column names, dtypes, or spellings --
-categorical values are shown EXACTLY as they appear in the data, including capitalization and
-spacing, e.g. 'runout' vs 'run out' are NOT the same string, treat them exactly as listed):
-{schema}
+        st.markdown("#### Preview")
+        st.dataframe(df.head(20))
 
-Rules you must follow:
-1. Wrong aggregation scope: NEVER blindly count or sum a column without explicitly checking if it makes sense (e.g., if analyzing total runs, check if it's batter runs or total runs; if balls faced, distinguish legal deliveries from wides/no-balls). Use the schema to determine the correct columns.
-2. Column hallucination: Before using df["column"], verify it exists exactly as spelled in the schema. NEVER silently invent or auto-correct a column name. If it doesn't exist, ask for clarification or explicitly state the assumption.
-3. Filter before aggregation: ALWAYS apply filters/exclusions (e.g. filtered_df = df[condition]) BEFORE grouping or aggregating. DO NOT subtract values post-aggregation unless mathematically necessary.
-4. NaN handling: Explicitly consider missing values (NaNs) in your code. Distinguish between .count() (ignores NaNs) and .size() (includes NaNs) when counting rows. Never let NaNs silently pass through.
-5. Dtype mismatches: Inspect .dtypes before filtering or comparing. If a numeric comparison is needed on a text column, use pd.to_numeric(..., errors="coerce") instead of direct string-number comparison.
-6. Explicit sorting: For ranking questions (top, bottom, highest, lowest, most, least), explicitly sort the result using .sort_values(ascending=True/False). Never rely on default ordering.
-7. Empty-result validation: If a filter returns 0 rows, check actual values using .unique() or case-insensitive matching (.str.lower()) to see if it's a casing/formatting issue. DO NOT immediately answer 0 without investigating.
-8. Execution timeout / iterations: If execution results in an error Observation, you have exactly 2 repair attempts. Identify the error, fix the code, and retry. If it still fails, your Final Answer MUST state "Failed to execute query due to error" (do NOT fabricate an answer).
-9. Chart generation: When generating a chart, save it explicitly with a unique filename (e.g. plt.savefig('chart_1.png')). Do not use plt.show(). Verify it exists and is not empty (os.path.exists() and os.path.getsize() > 0) before your Final Answer.
-10. Preserve original dataframe: NEVER overwrite or drop from the original df. Always assign filtered data to a new variable (e.g., working_df = df.copy()).
-11. Cricket overs: For encoded overs (e.g. 5.1, 5.2), do NOT invent mathematical formulas. Use int(val) for the over number and validate actual dataset values before applying.
-12. Ties: For "highest", "most", "maximum", return ALL tied rows. Do not arbitrarily pick one unless explicitly requested.
-13. Conversation context (Follow-ups): When asked a follow-up (e.g. "show top 3", "what about team X?"), adapt the previous filtering/aggregation logic instead of starting from scratch. Maintain prior exclusions.
-14. Concrete Final Answer: You must always give a concrete final answer based on actual tool Observations.
+    elif st.session_state.page == "Visualizations":
+        st.markdown("## Visualizations")
+        charts = [t for t in st.session_state.chat_history if t.get("chart")]
+        if not charts:
+            st.caption("No charts generated yet \u2014 ask a question that requests a chart from the Ask Data page.")
+        else:
+            vcols = st.columns(2)
+            for i, turn in enumerate(charts):
+                with vcols[i % 2]:
+                    st.markdown(f"**{turn['q']}**")
+                    if turn["chart"] and os.path.exists(turn["chart"]):
+                        st.image(turn["chart"])
+                        with open(turn["chart"], "rb") as cf:
+                            st.download_button("Download PNG", cf, file_name=os.path.basename(turn["chart"]), key=f"dl_{i}")
+                    else:
+                        st.caption("(chart file no longer available)")
 
-Conversation history:
-{chat_history}
+    elif st.session_state.page == "Data Explorer":
+        st.markdown("## Data Explorer")
+        search = st.text_input("Search across all columns", "")
+        display_df = df
+        if search.strip():
+            mask = df.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False)).any(axis=1)
+            display_df = df[mask]
+        st.caption(f"Showing {len(display_df):,} of {len(df):,} rows")
+        st.dataframe(display_df, height=500)
 
-Tools: {tools}
-Tool names: {tool_names}
+    else:  # Ask Data
+        # locking the repl down to just these 3 objects so it cant touch disk/files/internet
+        safe_locals = {"df": df, "pd": pd, "plt": plt}
+        repl_tool = PythonAstREPLTool(locals=safe_locals)
+        repl_tool.name = "python_repl"
+        repl_tool.description = (
+            "A restricted Python execution environment with access ONLY to a pandas dataframe named df, "
+            "pandas as pd, and matplotlib.pyplot as plt. Use it to run pandas code that "
+            "answers questions about the data. To make a chart, build it with plt and "
+            "save it using a unique filename (e.g. plt.savefig('chart_1.png')). Verify it "
+            "is saved and not empty using os.path.exists and os.path.getsize instead of plt.show()."
+        )
+        tools = [repl_tool]
 
-Use this exact format:
-Question: the input question
-Thought: your reasoning
-Action: one of [{tool_names}]
-Action Input: the code to run
-Observation: result of the code
-... (Thought/Action/Action Input/Observation can repeat)
-Thought: I now know the final answer
-Final Answer: the answer to the user, including the code you ran
+        prompt = PromptTemplate.from_template("""
+    You are a careful data analyst agent. A pandas dataframe called df is already loaded (do not reload or redefine it).
+    Answer the user's question by writing and running pandas/matplotlib code with the python_repl tool.
+    Always include the exact code you ran in your final answer, for transparency.
 
-Question: {input}
-{agent_scratchpad}
-""")
+    Dataset schema (trust this, do not guess or assume column names, dtypes, or spellings --
+    categorical values are shown EXACTLY as they appear in the data, including capitalization and
+    spacing, e.g. 'runout' vs 'run out' are NOT the same string, treat them exactly as listed):
+    {schema}
 
-    agent = create_react_agent(llm, tools, prompt)
-    executor = AgentExecutor(
-        agent=agent, tools=tools, verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=15,
-        max_execution_time=120,
-        early_stopping_method="generate",
-    )
+    Rules you must follow:
+    1. Wrong aggregation scope: NEVER blindly count or sum a column without explicitly checking if it makes sense (e.g., if analyzing total runs, check if it's batter runs or total runs; if balls faced, distinguish legal deliveries from wides/no-balls). Use the schema to determine the correct columns.
+    2. Column hallucination: Before using df["column"], verify it exists exactly as spelled in the schema. NEVER silently invent or auto-correct a column name. If it doesn't exist, ask for clarification or explicitly state the assumption.
+    3. Filter before aggregation: ALWAYS apply filters/exclusions (e.g. filtered_df = df[condition]) BEFORE grouping or aggregating. DO NOT subtract values post-aggregation unless mathematically necessary.
+    4. NaN handling: Explicitly consider missing values (NaNs) in your code. Distinguish between .count() (ignores NaNs) and .size() (includes NaNs) when counting rows. Never let NaNs silently pass through.
+    5. Dtype mismatches: Inspect .dtypes before filtering or comparing. If a numeric comparison is needed on a text column, use pd.to_numeric(..., errors="coerce") instead of direct string-number comparison.
+    6. Explicit sorting: For ranking questions (top, bottom, highest, lowest, most, least), explicitly sort the result using .sort_values(ascending=True/False). Never rely on default ordering.
+    7. Empty-result validation: If a filter returns 0 rows, check actual values using .unique() or case-insensitive matching (.str.lower()) to see if it's a casing/formatting issue. DO NOT immediately answer 0 without investigating.
+    8. Execution timeout / iterations: If execution results in an error Observation, you have exactly 2 repair attempts. Identify the error, fix the code, and retry. If it still fails, your Final Answer MUST state "Failed to execute query due to error" (do NOT fabricate an answer).
+    9. Chart generation: When generating a chart, save it explicitly with a unique filename (e.g. plt.savefig('chart_1.png')). Do not use plt.show(). Verify it exists and is not empty (os.path.exists() and os.path.getsize() > 0) before your Final Answer.
+    10. Preserve original dataframe: NEVER overwrite or drop from the original df. Always assign filtered data to a new variable (e.g., working_df = df.copy()).
+    11. Cricket overs: For encoded overs (e.g. 5.1, 5.2), do NOT invent mathematical formulas. Use int(val) for the over number and validate actual dataset values before applying.
+    12. Ties: For "highest", "most", "maximum", return ALL tied rows. Do not arbitrarily pick one unless explicitly requested.
+    13. Conversation context (Follow-ups): When asked a follow-up (e.g. "show top 3", "what about team X?"), adapt the previous filtering/aggregation logic instead of starting from scratch. Maintain prior exclusions.
+    14. Concrete Final Answer: You must always give a concrete final answer based on actual tool Observations.
 
-    for turn in st.session_state.chat_history:
-        with st.chat_message("user"):
-            st.write(turn['q'])
-        with st.chat_message("assistant"):
-            if turn.get("provider"):
-                st.caption(f"DataWhisper · {turn['provider']}")
-            else:
-                st.caption("DataWhisper")
-            st.write(turn["a"])
-            if turn.get("chart"):
-                st.image(turn["chart"])
+    Conversation history:
+    {chat_history}
 
-    suggested = None
-    st.write("")
-    st.caption("Suggested questions")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    if sc1.button("Top 5 products"): suggested = "Top 5 products"
-    if sc2.button("Find anomalies"): suggested = "Find anomalies"
-    if sc3.button("Show trends"): suggested = "Show trends"
-    if sc4.button("Find missing values"): suggested = "Find missing values"
-    
-    question = st.chat_input("Ask anything about your data...") or suggested
-    if question:
-        plt.close("all")
+    Tools: {tools}
+    Tool names: {tool_names}
 
-        history_text = "\n".join(
-            f"Q: {t['q']}\nA: {t['a']}" for t in st.session_state.chat_history[-5:]
-        ) or "None yet."
+    Use this exact format:
+    Question: the input question
+    Thought: your reasoning
+    Action: one of [{tool_names}]
+    Action Input: the code to run
+    Observation: result of the code
+    ... (Thought/Action/Action Input/Observation can repeat)
+    Thought: I now know the final answer
+    Final Answer: the answer to the user, including the code you ran
 
-        with st.spinner("Thinking..."):
-            result = None
-            error_to_show = None
-            provider_used = "Ollama" if is_ollama else "Groq"
-            
-            try:
-                result = executor.invoke({"input": question, "chat_history": history_text, "schema": schema_summary})
-            except Exception as e:
-                if not is_ollama:
-                    st.session_state.provider_error = True
-                error_to_show = e
+    Question: {input}
+    {agent_scratchpad}
+    """)
 
-            if error_to_show is not None:
-                if isinstance(error_to_show, Exception):
-                    st.error(f"Error: {error_to_show}")
-                    with st.expander("▸ Technical details"):
-                        st.exception(error_to_show)
+        executor = build_agent(llm, tools, prompt)
+
+        for turn in st.session_state.chat_history:
+            with st.chat_message("user"):
+                st.write(turn['q'])
+            with st.chat_message("assistant"):
+                if turn.get("provider"):
+                    st.caption(f"DataWhisperer · {turn['provider']}")
                 else:
-                    st.error(error_to_show)
-                if st.session_state.provider_error:
-                    st.warning("Groq API is unavailable. Would you like to switch to Local Ollama?")
-                    switch_col, stay_col = st.columns(2)
-                    if switch_col.button("Switch to Ollama", type="primary"):
-                        st.session_state.llm_provider = "Local Ollama"
-                        st.session_state.provider_error = False
-                        st.rerun()
-                    if stay_col.button("Stay with Groq"):
-                        st.session_state.provider_error = False
-                        st.rerun()
-            elif result is not None:
+                    st.caption("DataWhisperer")
+                st.write(turn["a"])
+                if turn.get("chart"):
+                    st.image(turn["chart"])
+
+        suggested = None
+        st.write("")
+        st.caption("Suggested questions")
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        if sc1.button("Top 5 products"): suggested = "Top 5 products"
+        if sc2.button("Find anomalies"): suggested = "Find anomalies"
+        if sc3.button("Show trends"): suggested = "Show trends"
+        if sc4.button("Missing values"): suggested = "Missing values"
+
+        question = st.chat_input("Ask anything about your data...") or suggested
+        if question:
+            plt.close("all")
+
+            history_text = "\n".join(
+                f"Q: {t['q']}\nA: {t['a']}" for t in st.session_state.chat_history[-5:]
+            ) or "None yet."
+
+            thinking_box = st.empty()
+            callback = ThinkingCallback(thinking_box)
+
+            result = None
+            provider_used = "Ollama" if is_ollama else "Groq"
+
+            try:
+                result = executor.invoke(
+                    {"input": question, "chat_history": history_text, "schema": schema_summary},
+                    config={"callbacks": [callback]},
+                )
+            except Exception as e:
+                thinking_box.empty()
+                if is_ollama:
+                    # Ollama failures are shown inline -- there's no "other provider" to fall back to
+                    # since the user explicitly chose Ollama.
+                    st.error(f"Error running local Ollama model: {e}")
+                    with st.expander("▸ Technical details"):
+                        st.exception(e)
+                    result = None
+                else:
+                    err_type, err_msg = classify_groq_error(e)
+                    st.session_state.groq_error = {"type": err_type, "msg": err_msg}
+                    st.rerun()
+
+            if result is not None:
                 answer = result["output"]
                 intermediate = result.get("intermediate_steps", [])
 
@@ -301,6 +534,8 @@ Question: {input}
                     if pngs:
                         chart_path = max(pngs, key=os.path.getctime)
 
+                # spent way too long figuring out charts werent showing - turned out sometimes
+                # the agent builds the fig but never calls savefig at all. this grabs it anyway
                 if chart_path is None and plt.get_fignums():
                     chart_path = "chart.png"
                     plt.savefig(chart_path, bbox_inches="tight")
@@ -315,9 +550,13 @@ Question: {input}
                         else:
                             chart_path = unique_path
 
+                callback.advance_to(4)  # creating visualization (resolved by now either way)
+                time.sleep(0.3)  # let the final checkmark actually be visible before it disappears
+                thinking_box.empty()
+
                 warnings = validate_result(question, answer, chart_saved=bool(chart_path))
 
-                st.markdown("<div class='answer-heading'><span class='assistant-avatar'>◒</span><span>DataWhisper</span><span class='answer-label'>ANSWER</span></div>", unsafe_allow_html=True)
+                st.markdown("### Answer")
                 for w in warnings:
                     st.warning(f"⚠️ **Validation Warning:** {w}")
                 st.write(answer)
@@ -333,18 +572,17 @@ Question: {input}
                         st.code(str(observation))
 
                 st.session_state.chat_history.append({
-                    "q": question, 
-                    "a": answer, 
+                    "q": question,
+                    "a": answer,
                     "chart": chart_path,
                     "provider": provider_used
                 })
 else:
     st.markdown("""
     <div class="hero-container">
-        <div class="eyebrow">CSV INTELLIGENCE, WITHOUT THE FRICTION</div>
-        <h1 class="hero-title">Ask better questions<br><span>of your data.</span></h1>
+        <h1 class="hero-title">DataWhisperer</h1>
         <div class="hero-subtitle">
-            Upload a CSV and let DataWhisper turn rows into clear answers, useful trends, and beautiful visualizations.
+            Upload a CSV and ask questions in plain English. Get answers, tables, and beautiful visualizations.
         </div>
     </div>
     """, unsafe_allow_html=True)
